@@ -1,20 +1,37 @@
 package org.jruby.jcd;
 
+import java.lang.reflect.Array;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.jruby.Ruby;
 import org.jruby.RubyClass;
+import org.jruby.RubyFloat;
 import org.jruby.RubyModule;
 import org.jruby.RubyObject;
 import org.jruby.anno.JRubyConstant;
 import org.jruby.anno.JRubyMethod;
+import org.jruby.exceptions.RaiseException;
+import org.jruby.runtime.Block;
 import org.jruby.runtime.ObjectAllocator;
 import org.jruby.runtime.builtin.IRubyObject;
 
 public class Dispatch {
-    public static void initDispatch(Ruby ruby) {
-        RubyModule mDispatch = ruby.defineModule("Dispatch");
+    public static void initDispatch(Ruby runtime) {
+        RubyModule mDispatch = runtime.defineModule("Dispatch");
         mDispatch.defineAnnotatedConstants(Dispatch.class);
 
-        RubyClass cObject = mDispatch.defineClassUnder("Object", ruby.getObject(), DispatchObject.ALLOCATOR);
+        RubyClass cObject = mDispatch.defineClassUnder("Object", runtime.getObject(), DispatchObject.ALLOCATOR);
         cObject.defineAnnotatedMethods(DispatchObject.class);
 
         RubyClass cQueue = mDispatch.defineClassUnder("Queue", cObject, DispatchQueue.ALLOCATOR);
@@ -29,6 +46,44 @@ public class Dispatch {
 
         RubyClass cSemaphore = mDispatch.defineClassUnder("Semaphore", cObject, DispatchSemaphore.ALLOCATOR);
         cSemaphore.defineAnnotatedMethods(DispatchSemaphore.class);
+
+        boot(runtime, cQueue, cGroup, cSource, cSemaphore);
+    }
+
+    private static void boot(Ruby runtime, RubyClass cQueue, RubyClass cGroup, RubyClass cSource, RubyClass cSemaphore) {
+        // prepare the three workers
+        ScheduledExecutorService lowService = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), new ThreadFactory() {
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r);
+                t.setPriority(Thread.MIN_PRIORITY);
+                t.setDaemon(true);
+                return t;
+            }
+        });
+        ScheduledExecutorService defaultService = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), new ThreadFactory() {
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r);
+                t.setPriority(Thread.NORM_PRIORITY);
+                t.setDaemon(true);
+                return t;
+            }
+        });
+        ScheduledExecutorService highService = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), new ThreadFactory() {
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r);
+                t.setPriority(Thread.MAX_PRIORITY);
+                t.setDaemon(true);
+                return t;
+            }
+        });
+
+        DispatchQueue lowQueue = new DispatchQueue(runtime, cQueue, lowService);
+        DispatchQueue defaultQueue = new DispatchQueue(runtime, cQueue, defaultService);
+        DispatchQueue highQueue = new DispatchQueue(runtime, cQueue, highService);
+
+        cQueue.setInternalVariable("lowQueue", lowQueue);
+        cQueue.setInternalVariable("defaultQueue", defaultQueue);
+        cQueue.setInternalVariable("highQueue", highQueue);
     }
 
     @JRubyConstant public static final int TIME_NOW = 0;
@@ -64,12 +119,19 @@ public class Dispatch {
     public static class DispatchQueue extends DispatchObject {
         public static final ObjectAllocator ALLOCATOR = new ObjectAllocator() {
             public IRubyObject allocate(Ruby runtime, RubyClass klazz) {
-                return new DispatchQueue(runtime, klazz);
+                return new DispatchQueue(runtime, klazz, Executors.newScheduledThreadPool(1));
             }
         };
+        
+        private final ScheduledExecutorService service;
 
-        public DispatchQueue(Ruby runtime, RubyClass klazz) {
+        public DispatchQueue(Ruby runtime, RubyClass klazz, ScheduledExecutorService service) {
             super(runtime, klazz);
+            this.service = service;
+        }
+
+        public ScheduledExecutorService getService() {
+            return service;
         }
         
         @JRubyMethod(meta = true)
@@ -77,9 +139,22 @@ public class Dispatch {
             return self;
         }
         
-        @JRubyMethod(meta = true, rest = true)
-        public static IRubyObject concurrent(IRubyObject self, IRubyObject[] args) {
-            return self;
+        @JRubyMethod(meta = true)
+        public static IRubyObject concurrent(IRubyObject self) {
+            return (IRubyObject)self.getInternalVariables().getInternalVariable("defaultQueue");
+        }
+
+        @JRubyMethod(meta = true)
+        public static IRubyObject concurrent(IRubyObject self, IRubyObject queueType) {
+            String type = queueType.asJavaString();
+            if (type.equals("low")) {
+                return (IRubyObject)self.getInternalVariables().getInternalVariable("lowQueue");
+            } else if (type.equals("default")) {
+                return (IRubyObject)self.getInternalVariables().getInternalVariable("defaultQueue");
+            } else if (type.equals("high")) {
+                return (IRubyObject)self.getInternalVariables().getInternalVariable("highQueue");
+            }
+            throw self.getRuntime().newArgumentError("invalid priority `" + type + "' (expected either :low, :default or :high");
         }
         
         @JRubyMethod
@@ -98,22 +173,63 @@ public class Dispatch {
         }
 
         @JRubyMethod
-        public IRubyObject apply(IRubyObject arg) {
-            return this;
-        }
-
-        @JRubyMethod(rest = true)
-        public IRubyObject async(IRubyObject[] args) {
+        public IRubyObject apply(IRubyObject arg, final Block block) {
+            final Ruby runtime = getRuntime();
+            int size = (int)arg.convertToInteger().getLongValue();
+            List<Callable<IRubyObject>> jobs = new ArrayList(size);
+            for (int i = 0; i < size; i++) {
+                jobs.add(blockToCallableWithIndex(runtime, block, i));
+            }
+            try {
+                service.invokeAll(jobs);
+            } catch (InterruptedException ie) {
+                if (runtime.isVerbose()) ie.printStackTrace(runtime.getErrorStream());
+                throw runtime.newThreadError("interrupted while applying jobs");
+            }
             return this;
         }
 
         @JRubyMethod
-        public IRubyObject sync() {
-            return this;
+        public IRubyObject async(final Block block) {
+            final Ruby runtime = getRuntime();
+            Callable job = blockToCallable(runtime, block);
+            service.submit(job);
+            return runtime.getNil();
         }
 
         @JRubyMethod
-        public IRubyObject after(IRubyObject arg) {
+        public IRubyObject async(IRubyObject group, Block block) {
+            final Ruby runtime = getRuntime();
+            Callable job = blockToCallable(runtime, block);
+            service.submit(job);
+            return runtime.getNil();
+        }
+
+        @JRubyMethod
+        public IRubyObject sync(final Block block) {
+            final Ruby runtime = getRuntime();
+            Callable job = blockToCallable(runtime, block);
+            try {
+                service.submit(job).get();
+            } catch (ExecutionException ex) {
+                if (ex.getCause() instanceof RaiseException) {
+                    throw (RaiseException)ex.getCause();
+                }
+                if (runtime.isVerbose()) ex.printStackTrace(runtime.getErrorStream());
+                throw runtime.newRuntimeError("exception in synchronous job: " + ex.getLocalizedMessage());
+            } catch (InterruptedException ie) {
+                if (runtime.isVerbose()) ie.printStackTrace(runtime.getErrorStream());
+                throw runtime.newThreadError("interrupted while submitting synchronous job");
+            }
+            return runtime.getNil();
+        }
+
+        @JRubyMethod
+        public IRubyObject after(IRubyObject timeout, final Block block) {
+            RubyFloat timeoutFloat = timeout.convertToFloat();
+            Callable job = blockToCallable(getRuntime(), block);
+
+            service.schedule(job, (long)(timeoutFloat.getDoubleValue() * 1000000), TimeUnit.MICROSECONDS);
             return this;
         }
 
@@ -126,6 +242,24 @@ public class Dispatch {
         @JRubyMethod
         public IRubyObject to_s() {
             return this;
+        }
+
+        private static Callable<IRubyObject> blockToCallable(final Ruby runtime, final Block block) {
+            Callable<IRubyObject> job = new Callable<IRubyObject>() {
+                public IRubyObject call() throws Exception {
+                    return block.call(runtime.getCurrentContext());
+                }
+            };
+            return job;
+        }
+
+        private static Callable<IRubyObject> blockToCallableWithIndex(final Ruby runtime, final Block block, final int index) {
+            Callable<IRubyObject> job = new Callable<IRubyObject>() {
+                public IRubyObject call() throws Exception {
+                    return block.call(runtime.getCurrentContext(), runtime.newFixnum(index));
+                }
+            };
+            return job;
         }
         
         /*
